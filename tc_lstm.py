@@ -8,22 +8,23 @@ import numpy as np
 import tensorflow as tf
 from utils import load_w2v, batch_index, load_inputs_twitter, load_word_id_mapping
 
-
 FLAGS = tf.app.flags.FLAGS
 tf.app.flags.DEFINE_integer('embedding_dim', 100, 'dimension of word embedding')
 tf.app.flags.DEFINE_integer('batch_size', 64, 'number of example per batch')
-tf.app.flags.DEFINE_integer('n_hidden', 200, 'number of hidden unit')
+tf.app.flags.DEFINE_integer('n_hidden', 100, 'number of hidden unit')
 tf.app.flags.DEFINE_float('learning_rate', 0.01, 'learning rate')
 tf.app.flags.DEFINE_integer('n_class', 3, 'number of distinct class')
 tf.app.flags.DEFINE_integer('max_sentence_len', 80, 'max number of tokens per sentence')
 tf.app.flags.DEFINE_float('l2_reg', 0.001, 'l2 regularization')
 tf.app.flags.DEFINE_integer('display_step', 4, 'number of test display step')
 tf.app.flags.DEFINE_integer('n_iter', 10, 'number of train iter')
+tf.app.flags.DEFINE_integer('attention_mode', 2, '1 or 2')
 
 tf.app.flags.DEFINE_string('train_file_path', 'data/twitter/train.raw', 'training file')
 tf.app.flags.DEFINE_string('validate_file_path', 'data/twitter/validate.raw', 'validating file')
 tf.app.flags.DEFINE_string('test_file_path', 'data/twitter/test.raw', 'testing file')
-tf.app.flags.DEFINE_string('embedding_file_path', 'data/twitter/twitter_word_embedding_partial_100.txt', 'embedding file')
+tf.app.flags.DEFINE_string('embedding_file_path', 'data/twitter/twitter_word_embedding_partial_100.txt',
+                           'embedding file')
 tf.app.flags.DEFINE_string('word_id_file_path', 'data/twitter/word_id.txt', 'word-id mapping file')
 tf.app.flags.DEFINE_string('type', 'TC', 'model type: ''(default), TD or TC')
 
@@ -31,7 +32,7 @@ tf.app.flags.DEFINE_string('type', 'TC', 'model type: ''(default), TD or TC')
 class LSTM(object):
 
     def __init__(self, embedding_dim=100, batch_size=64, n_hidden=100, learning_rate=0.01,
-                 n_class=3, max_sentence_len=50, l2_reg=0., display_step=4, n_iter=100, type_=''):
+                 n_class=3, max_sentence_len=50, l2_reg=0., display_step=4, n_iter=100, attention_mode=1, type_=''):
         self.embedding_dim = embedding_dim
         self.batch_size = batch_size
         self.n_hidden = n_hidden
@@ -41,6 +42,7 @@ class LSTM(object):
         self.l2_reg = l2_reg
         self.display_step = display_step
         self.n_iter = n_iter
+        self.attention_mode = attention_mode
         self.type_ = type_
         self.word_id_mapping, self.w2v = load_w2v(FLAGS.embedding_file_path, self.embedding_dim)
         self.word_embedding = tf.constant(self.w2v, name='word_embedding')
@@ -65,21 +67,83 @@ class LSTM(object):
             self.weights = {
                 'softmax_bi_lstm': tf.get_variable(
                     name='bi_lstm_w',
-                    shape=[2 * self.n_hidden, self.n_class],
+                    shape=[2, self.n_class],
                     initializer=tf.random_uniform_initializer(-0.003, 0.003),
-                    regularizer=tf.contrib.layers.l2_regularizer(self.l2_reg)
-                )
+                    regularizer=tf.contrib.layers.l2_regularizer(self.l2_reg)),
+                'softmax_for_attention2': tf.get_variable(
+                    name='softmax_w',
+                    shape=[2 * self.n_hidden, self.n_class],
+                    initializer=tf.random_uniform_initializer(-0.01, 0.01),
+                    regularizer=tf.contrib.layers.l2_regularizer(self.l2_reg))
             }
 
-        with tf.name_scope('biases'):
-            self.biases = {
-                'softmax_bi_lstm': tf.get_variable(
-                    name='bi_lstm_b',
-                    shape=[self.n_class],
-                    initializer=tf.random_uniform_initializer(-0.003, 0.003),
-                    regularizer=tf.contrib.layers.l2_regularizer(self.l2_reg)
-                )
-            }
+            with tf.name_scope('biases'):
+                self.biases = {
+                    'softmax_bi_lstm': tf.get_variable(
+                        name='bi_lstm_b',
+                        shape=[self.n_class],
+                        initializer=tf.random_uniform_initializer(-0.003, 0.003),
+                        regularizer=tf.contrib.layers.l2_regularizer(self.l2_reg)),
+                    'softmax_for_attention2': tf.get_variable(
+                        name='softmax_b',
+                        shape=[self.n_class],
+                        initializer=tf.random_uniform_initializer(-0.01, 0.01),
+                        regularizer=tf.contrib.layers.l2_regularizer(self.l2_reg))
+                }
+            self.W_fw = tf.get_variable(
+                name='W_fw',
+                shape=[self.n_hidden, self.n_hidden],
+                initializer=tf.random_uniform_initializer(-0.01, 0.01),
+                regularizer=tf.contrib.layers.l2_regularizer(self.l2_reg)
+            )
+            self.W_bw = tf.get_variable(
+                name='W_bw',
+                shape=[self.n_hidden, self.n_hidden],
+                initializer=tf.random_uniform_initializer(-0.01, 0.01),
+                regularizer=tf.contrib.layers.l2_regularizer(self.l2_reg)
+            )
+            self.W_fw_2 = tf.get_variable(
+                name='W_fw_2',
+                shape=[self.n_hidden + self.embedding_dim, self.n_hidden + self.embedding_dim],
+                initializer=tf.random_uniform_initializer(-0.01, 0.01),
+                regularizer=tf.contrib.layers.l2_regularizer(self.l2_reg)
+            )
+            self.W_bw_2 = tf.get_variable(
+                name='W_bw_2',
+                shape=[self.n_hidden + self.embedding_dim, self.n_hidden + self.embedding_dim],
+                initializer=tf.random_uniform_initializer(-0.01, 0.01),
+                regularizer=tf.contrib.layers.l2_regularizer(self.l2_reg)
+            )
+            self.w_fw = tf.get_variable(
+                name='w_fw',
+                shape=[self.n_hidden + self.embedding_dim, 1],
+                initializer=tf.random_uniform_initializer(-0.01, 0.01),
+                regularizer=tf.contrib.layers.l2_regularizer(self.l2_reg)
+            )
+            self.w_bw = tf.get_variable(
+                name='w_bw',
+                shape=[self.n_hidden + self.embedding_dim, 1],
+                initializer=tf.random_uniform_initializer(-0.01, 0.01),
+                regularizer=tf.contrib.layers.l2_regularizer(self.l2_reg)
+            )
+            self.V = tf.get_variable(
+                name='w',
+                shape=[2, 1],
+                initializer=tf.random_uniform_initializer(-0.01, 0.01),
+                regularizer=tf.contrib.layers.l2_regularizer(self.l2_reg)
+            )
+            self.Wp = tf.get_variable(
+                name='Wp',
+                shape=[self.n_hidden, self.n_hidden],
+                initializer=tf.random_uniform_initializer(-0.01, 0.01),
+                regularizer=tf.contrib.layers.l2_regularizer(self.l2_reg)
+            )
+            self.Wx = tf.get_variable(
+                name='Wx',
+                shape=[self.n_hidden, self.n_hidden],
+                initializer=tf.random_uniform_initializer(-0.01, 0.01),
+                regularizer=tf.contrib.layers.l2_regularizer(self.l2_reg)
+            )
 
     def bi_dynamic_lstm(self, inputs_fw, inputs_bw):
         """
@@ -114,9 +178,96 @@ class LSTM(object):
             index = tf.range(0, batch_size) * self.max_sentence_len + (self.sen_len_bw - 1)
             output_bw = tf.gather(tf.reshape(outputs_bw, [-1, self.n_hidden]), index)  # batch_size * n_hidden
 
-        output = tf.concat([output_fw, output_bw], 1)  # batch_size * 2n_hidden
+        output = tf.concat([output_fw, output_bw], 1)
         predict = tf.matmul(output, self.weights['softmax_bi_lstm']) + self.biases['softmax_bi_lstm']
+
         return predict
+
+    def bi_AT(self, inputs_fw, inputs_bw, target):
+        with tf.name_scope('forward_lstm'):
+            outputs_fw, state_fw = tf.nn.dynamic_rnn(
+                tf.nn.rnn_cell.LSTMCell(self.n_hidden),
+                inputs=inputs_fw,
+                sequence_length=self.sen_len,
+                dtype=tf.float32,
+                scope='LSTM_fw'
+            )
+            h_fw = self.attention2(outputs_fw, target, "fw")
+        with tf.name_scope('backward_lstm'):
+            outputs_bw, state_bw = tf.nn.dynamic_rnn(
+                tf.nn.rnn_cell.LSTMCell(self.n_hidden),
+                inputs=inputs_bw,
+                sequence_length=self.sen_len_bw,
+                dtype=tf.float32,
+                scope='LSTM_bw'
+            )
+            h_bw = self.attention2(outputs_bw, target, "bw")
+
+        output = tf.concat([h_fw, h_bw], 1)
+        if self.attention_mode == 1:
+            predict = tf.nn.softmax(tf.matmul(output, self.weights['softmax_bi_lstm']) + self.biases['softmax_bi_lstm'])
+        elif self.attention_mode == 2:
+            predict = LSTM.softmax_layer(output, self.weights['softmax_for_attention2'],
+                                         self.biases['softmax_for_attention2'], self.dropout_keep_prob)
+        return predict
+
+    def attention(self, inputs, target, type):
+        inputs = tf.reshape(inputs, [-1, self.n_hidden])
+        target = tf.reshape(target, [-1, self.n_hidden])
+        target = tf.transpose(target, [1, 0])
+        print(target)
+        if type == "fw":
+            temp = tf.matmul(inputs, self.W_fw)
+        elif type == "bw":
+            temp = tf.matmul(inputs, self.W_bw)
+
+        at = tf.transpose(tf.nn.softmax(tf.matmul(temp, target)), [1, 0])
+
+        output = tf.reshape(tf.reduce_sum(tf.matmul(at, inputs), 1), [-1, 1])
+
+        return output
+
+    def attention2(self, inputs, target, type):
+        # from AT-LSTM
+        batch_size = tf.shape(inputs)[0]
+
+        target = tf.reshape(target, [-1, 1, self.embedding_dim])
+        target = tf.ones([batch_size, self.max_sentence_len, self.embedding_dim], dtype=tf.float32) * target
+
+        h_t = tf.reshape(tf.concat([inputs, target], 2), [-1, self.n_hidden + self.embedding_dim])
+        if type == "fw":
+            M = tf.matmul(tf.tanh(tf.matmul(h_t, self.W_fw_2)), self.w_fw)
+        elif type == "bw":
+            M = tf.matmul(tf.tanh(tf.matmul(h_t, self.W_bw_2)), self.w_bw)
+        alpha = LSTM.softmax(tf.reshape(M, [-1, 1, self.max_sentence_len]), self.sen_len, self.max_sentence_len)
+        self.alpha = tf.reshape(alpha, [-1, self.max_sentence_len])
+
+        r = tf.reshape(tf.matmul(alpha, inputs), [-1, self.n_hidden])
+        index = tf.range(0, batch_size) * self.max_sentence_len + (self.sen_len - 1)
+        hn = tf.gather(tf.reshape(inputs, [-1, self.n_hidden]), index)  # batch_size * n_hidden
+
+        h = tf.tanh(tf.matmul(r, self.Wp) + tf.matmul(hn, self.Wx))
+
+        return h
+
+    @staticmethod
+    def softmax_layer(inputs, weights, biases, keep_prob):
+        with tf.name_scope('softmax'):
+            outputs = tf.nn.dropout(inputs, keep_prob=keep_prob)
+            predict = tf.matmul(outputs, weights) + biases
+            predict = tf.nn.softmax(predict)
+        return predict
+
+    @staticmethod
+    def softmax(inputs, length, max_length):
+        inputs = tf.cast(inputs, tf.float32)
+        max_axis = tf.reduce_max(inputs, 2, keep_dims=True)
+        inputs = tf.exp(inputs - max_axis)
+        length = tf.reshape(length, [-1])
+        mask = tf.reshape(tf.cast(tf.sequence_mask(length, max_length), tf.float32), tf.shape(inputs))
+        inputs *= mask
+        _sum = tf.reduce_sum(inputs, reduction_indices=2, keep_dims=True) + 1e-9
+        return inputs / _sum
 
     def run(self):
         inputs_fw = tf.nn.embedding_lookup(self.word_embedding, self.x)
@@ -126,7 +277,10 @@ class LSTM(object):
         target = tf.zeros([batch_size, self.max_sentence_len, self.embedding_dim]) + target
         inputs_fw = tf.concat([inputs_fw, target], 2)
         inputs_bw = tf.concat([inputs_bw, target], 2)
-        prob = self.bi_dynamic_lstm(inputs_fw, inputs_bw)
+        # prob = self.bi_dynamic_lstm(inputs_fw, inputs_bw)
+        prob = self.bi_AT(inputs_fw, inputs_bw,
+                          tf.reduce_mean(tf.nn.embedding_lookup(self.word_embedding, self.target_words), 1,
+                                         keep_dims=True))
 
         with tf.name_scope('loss'):
             cost = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=prob, labels=self.y))
@@ -148,7 +302,8 @@ class LSTM(object):
             test_summary_op = tf.summary.merge([summary_loss, summary_acc])
             import time
             timestamp = str(int(time.time()))
-            _dir = 'logs/' + str(timestamp) + '_' + self.type_ + '_r' + str(self.learning_rate) + '_b' + str(self.batch_size) + '_l' + str(self.l2_reg)
+            _dir = 'logs/' + str(timestamp) + '_' + self.type_ + '_r' + str(self.learning_rate) + '_b' + str(
+                self.batch_size) + '_l' + str(self.l2_reg)
             train_summary_writer = tf.summary.FileWriter(_dir + '/train', sess.graph)
             test_summary_writer = tf.summary.FileWriter(_dir + '/test', sess.graph)
             validate_summary_writer = tf.summary.FileWriter(_dir + '/validate', sess.graph)
@@ -171,11 +326,13 @@ class LSTM(object):
 
             max_acc = 0.
             for i in range(self.n_iter):
-                for train, _ in self.get_batch_data(tr_x, tr_sen_len, tr_x_bw, tr_sen_len_bw, tr_y, tr_target_word, self.batch_size, 0.5):
+                for train, _ in self.get_batch_data(tr_x, tr_sen_len, tr_x_bw, tr_sen_len_bw, tr_y, tr_target_word,
+                                                    self.batch_size, 0.5):
                     _, step, summary = sess.run([optimizer, global_step, train_summary_op], feed_dict=train)
                     train_summary_writer.add_summary(summary, step)
                 acc, loss, cnt = 0., 0., 0
-                for test, num in self.get_batch_data(te_x, te_sen_len, te_x_bw, te_sen_len_bw, te_y, te_target_word, 2000, 1.0):
+                for test, num in self.get_batch_data(te_x, te_sen_len, te_x_bw, te_sen_len_bw, te_y, te_target_word,
+                                                     2000, 1.0):
                     _loss, _acc, summary = sess.run([cost, accuracy, test_summary_op], feed_dict=test)
                     acc += _acc
                     loss += _loss * num
@@ -222,6 +379,7 @@ def main(_):
         l2_reg=FLAGS.l2_reg,
         display_step=FLAGS.display_step,
         n_iter=FLAGS.n_iter,
+        attention_mode=FLAGS.attention_mode,
         type_=FLAGS.type
     )
     lstm.run()
